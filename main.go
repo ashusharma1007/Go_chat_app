@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"log"
 	"net/http"
 	"time"
@@ -9,12 +8,23 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type MsgType string
+
+const (
+	PublicMessage  MsgType = "public"
+	PrivateMessage MsgType = "Private"
+	SystemMessage  MsgType = "system"
+)
+
 type Msg struct {
+	Type     MsgType   `json:"type"`
 	Username string    `json:"username"`
 	Content  string    `json:"content"`
 	Time     time.Time `json:"time"`
 	UserList []string  `json:"user_list"`
 	IsSystem bool      `json:"is_system"`
+	To       string    `json:"to,omitempty"`
+	From     string    `json:"from,omitempty"`
 }
 
 type Client struct {
@@ -26,6 +36,7 @@ type Client struct {
 type Hub struct {
 	Clients    map[*Client]bool
 	BroadCast  chan Msg
+	Private    chan Msg
 	Register   chan *Client
 	Unregister chan *Client
 }
@@ -33,9 +44,10 @@ type Hub struct {
 func NewHub() *Hub {
 	return &Hub{
 		Clients:    make(map[*Client]bool),
-		BroadCast:  make(chan Msg),
-		Register:   make(chan *Client),
-		Unregister: make(chan *Client),
+		BroadCast:  make(chan Msg, 256), // Buffered channel
+		Private:    make(chan Msg, 256),
+		Register:   make(chan *Client, 256), // Buffered channel
+		Unregister: make(chan *Client, 256), // Buffered channel
 	}
 }
 
@@ -44,11 +56,12 @@ func (h *Hub) Run() {
 		select {
 		case client := <-h.Register:
 			h.Clients[client] = true
-			log.Printf("Clients %s connected. Total Clients %d", client.Username, len(h.Clients))
+			log.Printf("Client %s connected. Total Clients %d", client.Username, len(h.Clients))
 
 			welcomeMsg := Msg{
+				Type:     SystemMessage,
 				Username: "System",
-				Content:  client.Username + "joined the chat",
+				Content:  client.Username + " joined the chat",
 				Time:     time.Now(),
 				IsSystem: true,
 				UserList: h.GetUserNames(),
@@ -59,28 +72,81 @@ func (h *Hub) Run() {
 			if _, ok := h.Clients[client]; ok {
 				delete(h.Clients, client)
 				close(client.Send)
-				log.Printf("Client %s disconnected. Totla Clients %d", client.Username, len(h.Clients))
+				log.Printf("Client %s disconnected. Total Clients %d", client.Username, len(h.Clients))
+
+				goodbyeMsg := Msg{
+					Type:     SystemMessage,
+					Username: "System",
+					Content:  client.Username + " left the chat",
+					Time:     time.Now(),
+					IsSystem: true,
+					UserList: h.GetUserNames(),
+				}
+				h.BroadCast <- goodbyeMsg
 			}
-			goodbyeMsg := Msg{
-				Username: "System",
-				Content:  client.Username + "left the chat",
-				Time:     time.Now(),
-				IsSystem: true,
-				UserList: h.GetUserNames(),
-			}
-			h.BroadCast <- goodbyeMsg
 
 		case message := <-h.BroadCast:
+			log.Printf("Broadcasting message from %s: %s", message.Username, message.Content)
+			// Always update user list for all messages
+			message.UserList = h.GetUserNames()
+
+			// Send to ALL connected clients
 			for client := range h.Clients {
 				select {
 				case client.Send <- message:
+					log.Printf("Message sent to %s", client.Username)
 				default:
+					log.Printf("Failed to send to %s, closing connection", client.Username)
 					close(client.Send)
 					delete(h.Clients, client)
 				}
 			}
-		}
 
+		case privateMsg := <-h.Private:
+			log.Printf("Sending private messages from %s to %s", privateMsg.From, privateMsg.To)
+
+			var sender, recipient *Client
+			for client := range h.Clients {
+				if client.Username == privateMsg.From {
+					sender = client
+				}
+				if client.Username == privateMsg.To {
+					recipient = client
+				}
+			}
+			if sender != nil {
+				select {
+				case sender.Send <- privateMsg:
+					log.Printf("Private message sent to sender %s", sender.Username)
+				default:
+					log.Printf("Failed to send private message to sender %s", sender.Username)
+				}
+			}
+
+			if recipient != nil {
+				select {
+				case recipient.Send <- privateMsg:
+					log.Printf("Private message sent to recipient %s", recipient.Username)
+				default:
+					log.Printf("Failed to send private message to recipient %s", recipient.Username)
+				}
+			} else {
+				// Recipient not found, send error message to sender
+				if sender != nil {
+					errorMsg := Msg{
+						Type:     SystemMessage,
+						Username: "System",
+						Content:  "User '" + privateMsg.To + "' is not online",
+						Time:     time.Now(),
+						IsSystem: true,
+					}
+					select {
+					case sender.Send <- errorMsg:
+					default:
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -99,17 +165,22 @@ var upgrader = websocket.Upgrader{
 }
 
 func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
-
 	username := r.URL.Query().Get("username")
 	if username == "" {
-		errors.New("username not found")
+		log.Printf("WebSocket connection attempt without username")
+		http.Error(w, "Username required", http.StatusBadRequest)
+		return
 	}
+
+	log.Printf("WebSocket upgrade request from %s", username)
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("WebSocket upgrade error %s", err)
+		log.Printf("WebSocket upgrade error for %s: %s", username, err)
 		return
 	}
+
+	log.Printf("WebSocket connection established for %s", username)
 
 	client := &Client{
 		Username: username,
@@ -117,45 +188,69 @@ func handleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		Send:     make(chan Msg, 256),
 	}
 
-	hub.Register <- client
-
+	log.Printf("Starting goroutines for %s", username)
 	go client.readMessages(hub)
 	go client.writeMessages()
+
+	log.Printf("Registering client %s", username)
+	// Move registration after starting goroutines to prevent blocking
+	hub.Register <- client
 }
 
 func (c *Client) readMessages(hub *Hub) {
 	defer func() {
+		log.Printf("readMessages defer called for %s", c.Username)
 		hub.Unregister <- c
 		c.Conn.Close()
 	}()
+
+	log.Printf("Starting to read messages for %s", c.Username)
 
 	for {
 		var msg Msg
 		err := c.Conn.ReadJSON(&msg)
 		if err != nil {
-			log.Printf("Read error: %v", err)
+			log.Printf("Read error for %s: %v", c.Username, err)
 			break
 		}
+		log.Printf("Received message from %s: %s", c.Username, msg.Content)
 		msg.Username = c.Username
 		msg.Time = time.Now()
-
-		hub.BroadCast <- msg
+		if msg.Type == PrivateMessage && msg.To != "" {
+			// Private message
+			msg.From = c.Username
+			log.Printf("Received private message from %s to %s: %s", c.Username, msg.To, msg.Content)
+			hub.Private <- msg
+		} else {
+			// Public message
+			msg.Type = PublicMessage
+			msg.IsSystem = false
+			log.Printf("Received public message from %s: %s", c.Username, msg.Content)
+			hub.BroadCast <- msg
+		}
 	}
 }
 
 func (c *Client) writeMessages() {
-	defer c.Conn.Close()
+	defer func() {
+		log.Printf("writeMessages defer called for %s", c.Username)
+		c.Conn.Close()
+	}()
+
+	log.Printf("Starting to write messages for %s", c.Username)
 
 	for {
 		select {
 		case message, ok := <-c.Send:
 			if !ok {
+				log.Printf("Send channel closed for %s", c.Username)
 				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
+			log.Printf("Writing message to %s: %s", c.Username, message.Content)
 			if err := c.Conn.WriteJSON(message); err != nil {
-				log.Printf("Write error: %v", err)
+				log.Printf("Write error for %s: %v", c.Username, err)
 				return
 			}
 		}
@@ -179,225 +274,11 @@ func main() {
 	go hub.Run()
 
 	http.HandleFunc("/", serveHome)
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) { handleWebSocket(hub, w, r) })
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("/"))))
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		handleWebSocket(hub, w, r)
+	})
 
 	log.Println("Chat server starting on :8080")
 	log.Println("Visit http://localhost:8080 to use the chat")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
-
-//The CheckOrigin function allows WebSocket connections from any origin, but in a production application, you should implement security checks.
-
-// var jwtKey = []byte("your_secret_key")
-
-// type User struct {
-// 	Username string `json:"username"`
-// 	Password string `json:"password"`
-// }
-
-// var users = make(map[string]string)
-
-// type Claims struct {
-// 	Username string `json:"username"`
-// 	jwt.StandardClaims
-// }
-
-// // WebSocket upgrader
-// var upgrader = websocket.Upgrader{
-// 	CheckOrigin: func(r *http.Request) bool {
-// 		return true
-// 	},
-// }
-
-// type Message struct {
-// 	Username string `json:"username"`
-// 	Message  string `json:"message"`
-// }
-
-// var clients = make(map[*websocket.Conn]string)
-// var broadcast = make(chan Message)
-
-// var messageHistory = []Message{}
-
-// const maxMessageHistory = 50
-
-// func main() {
-// 	http.HandleFunc("/", homePage)
-// 	http.HandleFunc("/register", registerHandler)
-// 	http.HandleFunc("/login", loginHandler)
-// 	http.HandleFunc("/ws", authenticateWS(handleConnections))
-
-// 	go handleMessages()
-
-// 	fmt.Println("Server started on :8080")
-// 	err := http.ListenAndServe(":8080", nil)
-// 	if err != nil {
-// 		panic("Error starting server: " + err.Error())
-// 	}
-// }
-
-// func homePage(w http.ResponseWriter, r *http.Request) {
-// 	http.ServeFile(w, r, "index.html")
-// }
-
-// func loginHandler(w http.ResponseWriter, r *http.Request) {
-// 	if r.Method != "POST" {
-// 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-// 		return
-// 	}
-
-// 	var user User
-// 	err := json.NewDecoder(r.Body).Decode(&user)
-// 	if err != nil {
-// 		http.Error(w, "Invalid request body", http.StatusBadRequest)
-// 		return
-// 	}
-
-// 	storedPasssword, exists := users[user.Username]
-// 	if !exists {
-// 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-// 		return
-// 	}
-
-// 	err = bcrypt.CompareHashAndPassword([]byte(storedPasssword), []byte(user.Password))
-// 	if err != nil {
-// 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-// 		return
-// 	}
-
-// 	expirationTime := time.Now().Add(24 * time.Hour)
-// 	claims := &Claims{
-// 		Username: user.Username,
-// 		StandardClaims: jwt.StandardClaims{
-// 			ExpiresAt: expirationTime.Unix(),
-// 		},
-// 	}
-
-// 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-// 	tokenString, err := token.SignedString(jwtKey)
-// 	if err != nil {
-// 		http.Error(w, "Server error", http.StatusInternalServerError)
-// 		return
-// 	}
-
-// 	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
-
-// }
-
-// func registerHandler(w http.ResponseWriter, r *http.Request) {
-// 	if r.Method != "POST" {
-// 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-// 		return
-// 	}
-
-// 	var user User
-// 	err := json.NewDecoder(r.Body).Decode(&user)
-// 	if err != nil {
-// 		http.Error(w, "Username already exist", http.StatusConflict)
-// 		return
-// 	}
-
-// 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
-// 	if err != nil {
-// 		http.Error(w, "Server error", http.StatusInternalServerError)
-// 		return
-// 	}
-
-// 	users[user.Username] = string(hashedPassword)
-
-// 	w.WriteHeader(http.StatusCreated)
-// 	json.NewEncoder(w).Encode(map[string]string{"message": "User registered successfull"})
-
-// }
-
-// func authenticateWS(next http.HandlerFunc) http.HandlerFunc {
-// 	return func(w http.ResponseWriter, r *http.Request) {
-// 		// Get token from URL query parameter
-// 		tokenString := r.URL.Query().Get("token")
-// 		if tokenString == "" {
-// 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-// 			return
-// 		}
-
-// 		// Parse and validate token
-// 		claims := &Claims{}
-// 		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
-// 			return jwtKey, nil
-// 		})
-
-// 		if err != nil || !token.Valid {
-// 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-// 			return
-// 		}
-
-// 		// Store username in request context
-// 		ctx := r.Context()
-// 		r = r.WithContext(context.WithValue(ctx, "username", claims.Username))
-
-// 		// Call the next handler
-// 		next(w, r)
-// 	}
-// }
-
-// func handleConnections(w http.ResponseWriter, r *http.Request) {
-
-// 	username := r.Context().Value("username").(string)
-// 	// We upgrade the HTTP connection to a WebSocket connection using the upgrader
-// 	conn, err := upgrader.Upgrade(w, r, nil)
-// 	if err != nil {
-// 		fmt.Println(err)
-// 		return
-// 	}
-// 	defer conn.Close()
-
-// 	clients[conn] = username
-// 	joinMsg := Message{
-// 		Username: "System",
-// 		Message:  username + " has joined the chat",
-// 	}
-// 	broadcast <- joinMsg
-// 	for _, msg := range messageHistory {
-// 		err := conn.WriteJSON(msg)
-// 		if err != nil {
-// 			fmt.Println(err)
-// 			return
-// 		}
-// 	}
-
-// 	for {
-// 		var msg Message
-// 		err := conn.ReadJSON(&msg)
-// 		if err != nil {
-// 			fmt.Println(err)
-// 			delete(clients, conn)
-// 			return
-// 		}
-// 		msg.Username = username
-// 		broadcast <- msg
-
-// 	}
-// }
-
-// // This function listens for messages on the broadcast channel and sends them to all connected clients.
-// // If there’s an error sending a message to a client, we close their connection and remove them from the clients map.
-// func handleMessages() {
-
-// 	for {
-// 		msg := <-broadcast
-
-// 		messageHistory = append(messageHistory, msg)
-// 		if len(messageHistory) > maxMessageHistory {
-// 			messageHistory = messageHistory[1:]
-// 		}
-
-// 		for client := range clients {
-// 			err := client.WriteJSON(msg)
-// 			if err != nil {
-// 				fmt.Println(err)
-// 				client.Close()
-// 				delete(clients, client)
-// 			}
-// 		}
-// 	}
-// }
